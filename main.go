@@ -3,6 +3,7 @@ package main
 import (
 	"database/sql"
 	"fmt"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -13,8 +14,26 @@ import (
 
 const srcAcc = 0
 
+var step chan struct{}
+
 func main() {
-	db, err := sql.Open("mysql", "Kroot@tcp(127.0.0.1:4000)/test")
+	step = make(chan struct{}, 1000)
+
+	go func() {
+		var b [1]byte
+		for {
+			_, err := os.Stdin.Read(b[:])
+			if err != nil {
+				fmt.Println("???", err)
+			}
+			for i := 0; i < 10; i++ {
+				step <- struct{}{}
+			}
+			fmt.Println("single point debug")
+		}
+	}()
+
+	db, err := sql.Open("mysql", "root@tcp(127.0.0.1:4000)/test")
 	if err != nil {
 		panic(err)
 	}
@@ -63,7 +82,15 @@ type worker struct {
 }
 
 func (w *worker) start() {
-	fmt.Println("start worker:", w.no, w.outAcc.start, w.outAcc.end)
+	pessimistic := false
+	if w.no%2 == 0 {
+		_, err := w.db.Exec("set @@tidb_pessimistic_lock = 1")
+		if err != nil {
+			panic(err)
+		}
+		pessimistic = true
+	}
+	fmt.Println("start worker:", w.no, w.outAcc.start, w.outAcc.end, "pessimistic =", pessimistic)
 	i := w.outAcc.start
 	for {
 		done, err := w.transferTo(i)
@@ -90,13 +117,17 @@ func (w *worker) start() {
 }
 
 func (w *worker) transferTo(target int) (done bool, err error) {
-	//fmt.Println("worker", w.no, "transfer 1 to ", target)
-	//t := time.Now()
+	// <-step
+	fmt.Println("worker", w.no, "transfer 1 to ", target)
+	// t := time.Now()
+
 	tx, err := w.db.Begin()
 	if err != nil {
 		return false, err
 	}
 	result, err := tx.Query("select id, money from acc where id = ? for update", srcAcc)
+	// result, err := tx.Query(fmt.Sprintf("select id, money from acc where id = %d for update", srcAcc))
+	// result, err := tx.Query(fmt.Sprintf("select id, money from acc where id = %d", srcAcc))
 	if err != nil {
 		tx.Rollback()
 		return false, err
@@ -124,24 +155,27 @@ func (w *worker) transferTo(target int) (done bool, err error) {
 		return true, nil
 	}
 
-	//fmt.Println("worker", w.no, "get lock", currentMoney)
-
-	_, err = tx.Exec("update acc set money = money + 1 where id = ?", target)
-	if err != nil {
-		tx.Rollback()
-		return false, err
-	}
+	// fmt.Println("worker", w.no, "get lock", currentMoney)
 
 	_, err = tx.Exec("update acc set money = money - 1 where id = ?", srcAcc)
+	// _, err = tx.Exec(fmt.Sprintf("update acc set money = money - 1 where id = %d", srcAcc))
 	if err != nil {
 		tx.Rollback()
 		return false, err
 	}
+
+	_, err = tx.Exec("update acc set money = money + 1 where id = ?", target)
+	// _, err = tx.Exec(fmt.Sprintf("update acc set money = money + 1 where id = %d", target))
+	if err != nil {
+		tx.Rollback()
+		return false, err
+	}
+
 	err = tx.Commit()
 	if err != nil {
 		return false, err
 	}
-	//fmt.Println("tx time:", time.Since(t))
+	// fmt.Println("tx time:", time.Since(t))
 	return false, nil
 }
 
